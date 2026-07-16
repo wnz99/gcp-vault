@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly CONFIG_DIR="${HOME}/.config/gcp-vault/accounts"
+SCRIPT_SOURCE=${BASH_SOURCE[0]}
+while [[ -L $SCRIPT_SOURCE ]]; do
+  SCRIPT_SOURCE_DIR=$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd -P)
+  SCRIPT_SOURCE=$(readlink "$SCRIPT_SOURCE")
+  [[ $SCRIPT_SOURCE == /* ]] || SCRIPT_SOURCE="$SCRIPT_SOURCE_DIR/$SCRIPT_SOURCE"
+done
+SCRIPT_DIR=$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd -P)
+SCRIPT_PATH="$SCRIPT_DIR/$(basename "$SCRIPT_SOURCE")"
+readonly SCRIPT_DIR SCRIPT_PATH
+readonly INSTALL_PATH="${HOME}/.local/bin/gcp-vault"
+
+die() { printf 'gcp-vault: %s\n' "$*" >&2; exit 1; }
+usage() { printf 'Usage: gcp-vault install\n       gcp-vault list\n       gcp-vault login <account>\n       gcp-vault <account> [--] <command...>\n' >&2; exit 2; }
+
+resolve_path() {
+  local path=$1 path_dir
+  while [[ -L $path ]]; do
+    path_dir=$(cd "$(dirname "$path")" 2>/dev/null && pwd -P) || return 1
+    path=$(readlink "$path")
+    [[ $path == /* ]] || path="$path_dir/$path"
+  done
+  path_dir=$(cd "$(dirname "$path")" 2>/dev/null && pwd -P) || return 1
+  printf '%s/%s\n' "$path_dir" "$(basename "$path")"
+}
+
+install_wrapper() {
+  local target canonical_target
+
+  mkdir -p "$(dirname "$INSTALL_PATH")"
+  if [[ -e $INSTALL_PATH || -L $INSTALL_PATH ]]; then
+    [[ -L $INSTALL_PATH ]] || die "refusing to overwrite existing file: $INSTALL_PATH"
+    target=$(readlink "$INSTALL_PATH")
+    [[ $target == /* ]] || target="$(dirname "$INSTALL_PATH")/$target"
+    canonical_target=$(resolve_path "$target") || true
+    [[ -f $canonical_target && ! -L $canonical_target ]] || die "refusing to overwrite existing symlink: $INSTALL_PATH"
+    [[ $canonical_target == "$SCRIPT_PATH" ]] || cmp -s "$canonical_target" "$SCRIPT_PATH" || die "refusing to overwrite existing symlink: $INSTALL_PATH"
+    return
+  fi
+  ln -s "$SCRIPT_PATH" "$INSTALL_PATH"
+}
+
+require_installed_wrapper() {
+  local target canonical_target=''
+
+  if [[ -L $INSTALL_PATH ]]; then
+    target=$(readlink "$INSTALL_PATH")
+    [[ $target == /* ]] || target="$(dirname "$INSTALL_PATH")/$target"
+    canonical_target=$(resolve_path "$target") || true
+  fi
+  [[ -f $canonical_target && ! -L $canonical_target ]] || die "gcp-vault is not correctly installed at $INSTALL_PATH. Run: $SCRIPT_PATH install"
+  [[ $canonical_target == "$SCRIPT_PATH" ]] || cmp -s "$canonical_target" "$SCRIPT_PATH" || die "gcp-vault is not correctly installed at $INSTALL_PATH. Run: $SCRIPT_PATH install"
+}
+
+validate_alias() {
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $1 != '.' && $1 != '..' ]] || die "unsafe account alias: $1"
+}
+
+list_accounts() {
+  local path
+  [[ -d $CONFIG_DIR && ! -L $CONFIG_DIR ]] || return 0
+  while IFS= read -r -d '' path; do basename "$path"; done < <(find "$CONFIG_DIR" -maxdepth 1 -type f -print0 | sort -z)
+}
+
+load_config() {
+  local config_file=$1 line key value canonical base
+  local seen_cloudsdk_config=false seen_expected_account=false seen_allowed_projects=false
+  cloudsdk_config=''; expected_account=''; allowed_projects=''
+  [[ ! -L $config_file ]] || die 'account config must not be a symlink'
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line != *$'\r'* && $line != *[$'\001'-$'\037'$'\177']* ]] || die 'malformed config: control character'
+    [[ -n $line && $line == *=* ]] || die 'malformed config: expected key=value'
+    key=${line%%=*}; value=${line#*=}
+    case $key in cloudsdk_config|expected_account|allowed_projects) ;; *) die "unknown config key: $key" ;; esac
+    case $key in
+      cloudsdk_config) [[ $seen_cloudsdk_config == false ]] || die "duplicate config key: $key"; seen_cloudsdk_config=true ;;
+      expected_account) [[ $seen_expected_account == false ]] || die "duplicate config key: $key"; seen_expected_account=true ;;
+      allowed_projects) [[ $seen_allowed_projects == false ]] || die "duplicate config key: $key"; seen_allowed_projects=true ;;
+    esac
+    [[ -n $value ]] || die "empty config value: $key"
+    printf -v "$key" '%s' "$value"
+  done < "$config_file"
+  [[ $seen_cloudsdk_config == true ]] || die 'missing config key: cloudsdk_config'
+  [[ $seen_expected_account == true ]] || die 'missing config key: expected_account'
+  [[ $seen_allowed_projects == true ]] || die 'missing config key: allowed_projects'
+
+  [[ $cloudsdk_config == /* && $cloudsdk_config != *'/../'* && $cloudsdk_config != */.. && $cloudsdk_config != *'/./'* && $cloudsdk_config != */. ]] || die 'unsafe cloudsdk_config path'
+  [[ -d $cloudsdk_config && ! -L $cloudsdk_config ]] || die 'unsafe cloudsdk_config path'
+  canonical=$(cd "$cloudsdk_config" && pwd -P) || die 'unsafe cloudsdk_config path'
+  base="$HOME/.config/gcloud"
+  [[ $canonical == "$base" || $canonical == "$HOME/.config/gcloud-"* ]] || die 'cloudsdk_config is outside the allowed profile roots'
+  [[ $canonical == "$cloudsdk_config" ]] || die 'cloudsdk_config must be canonical'
+  [[ $expected_account =~ ^[A-Za-z0-9][A-Za-z0-9._%+-]{0,62}@[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] || die 'malformed expected_account'
+  [[ $allowed_projects =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9](,[a-z][a-z0-9-]{4,28}[a-z0-9])*$ ]] || die 'malformed allowed_projects'
+}
+
+reject_credential_overrides() {
+  local variable
+  local -a variables=(GOOGLE_CREDENTIALS GOOGLE_APPLICATION_CREDENTIALS GOOGLE_BACKEND_CREDENTIALS GOOGLE_OAUTH_ACCESS_TOKEN GOOGLE_IMPERSONATE_SERVICE_ACCOUNT GOOGLE_BACKEND_IMPERSONATE_SERVICE_ACCOUNT CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE CLOUDSDK_AUTH_ACCESS_TOKEN CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT CLOUDSDK_CONFIG CLOUDSDK_CORE_ACCOUNT GCP_VAULT_ACCOUNT)
+  for variable in "${variables[@]}"; do [[ -z ${!variable+x} ]] || die "refusing pre-set environment variable: $variable"; done
+}
+
+main() {
+  local alias config_file authenticated_account adc_file adc_token adc_email mode=run
+  (($# > 0)) || usage
+  if [[ $1 == install ]]; then (($# == 1)) || usage; install_wrapper; return; fi
+  require_installed_wrapper
+  if [[ $1 == list ]]; then (($# == 1)) || usage; list_accounts; return; fi
+  if [[ $1 == login ]]; then
+    (($# == 2)) || usage
+    mode=login
+    alias=$2
+  else
+    alias=$1; shift
+    if (($# > 0)) && [[ $1 == -- ]]; then shift; fi
+    (($# > 0)) || usage
+  fi
+  validate_alias "$alias"
+  reject_credential_overrides
+  command -v gcloud >/dev/null || die 'gcloud is required'
+  command -v curl >/dev/null || die 'curl is required'
+  command -v jq >/dev/null || die 'jq is required'
+  [[ -d $CONFIG_DIR && ! -L $CONFIG_DIR ]] || die 'account config directory is missing or unsafe'
+  [[ $(cd "$CONFIG_DIR" && pwd -P) == "$CONFIG_DIR" ]] || die 'account config directory must be canonical'
+  config_file="$CONFIG_DIR/$alias"
+  [[ -f $config_file && ! -L $config_file ]] || die "account config not found: $alias"
+  load_config "$config_file"
+  adc_file="$cloudsdk_config/application_default_credentials.json"
+
+  export CLOUDSDK_CONFIG="$cloudsdk_config" CLOUDSDK_CORE_ACCOUNT="$expected_account"
+  if [[ $mode == login ]]; then
+    gcloud auth login "$expected_account" || die "gcloud account login failed: $expected_account"
+    gcloud auth application-default login "$expected_account" || die "ADC login failed: $expected_account"
+  fi
+
+  [[ -f $adc_file && ! -L $adc_file ]] || die "ADC file not found or unsafe for account: $alias"
+  [[ $(cd "$(dirname "$adc_file")" && pwd -P)/$(basename "$adc_file") == "$adc_file" ]] || die 'ADC path must be canonical'
+  authenticated_account=$(gcloud auth list --filter="account=$expected_account" --format='value(account)' 2>/dev/null) || die 'failed to inspect gcloud identities'
+  [[ $authenticated_account == "$expected_account" ]] || die "expected gcloud account is not authenticated: $expected_account"
+  gcloud auth print-access-token --account="$expected_account" >/dev/null 2>&1 || die "could not validate gcloud account token: $expected_account"
+
+  export GOOGLE_APPLICATION_CREDENTIALS="$adc_file"
+  adc_token=$(gcloud auth application-default print-access-token 2>/dev/null) || die 'could not obtain ADC access token'
+  [[ -n $adc_token && $adc_token != *[$'\r\n']* ]] || die 'invalid ADC access token'
+  adc_email=$(printf 'access_token=%s' "$adc_token" | curl --disable --noproxy '*' --proto '=https' --tlsv1.2 --silent --show-error --fail --request POST --data-binary @- https://oauth2.googleapis.com/tokeninfo | jq -er '.email') || { unset adc_token; die 'could not validate ADC identity'; }
+  unset adc_token
+  [[ $adc_email == "$expected_account" ]] || die "ADC identity does not match expected account: $expected_account"
+
+  if [[ $mode == login ]]; then
+    printf 'gcp-vault: authenticated account %s for alias %s\n' "$expected_account" "$alias"
+    return
+  fi
+
+  export GCP_VAULT_ACCOUNT="$alias" GCP_VAULT_EXPECTED_ACCOUNT="$expected_account" GCP_VAULT_ALLOWED_PROJECTS="$allowed_projects"
+  exec "$@"
+}
+
+main "$@"
