@@ -91,6 +91,8 @@ if output=$(run_vault list 2>&1); then fail 'list accepted a wrong installation 
 assert_contains "$output" "Run: $GCP_VAULT install"
 if output=$(run_vault install 2>&1); then fail 'install overwrote a wrong symlink'; fi
 assert_contains "$output" 'refusing to overwrite existing symlink'
+run_vault install --replace || fail 'explicit replacement rejected a symlink'
+[[ $(readlink "$INSTALL_PATH") == "$GCP_VAULT" ]] || fail 'explicit replacement created the wrong symlink target'
 rm "$INSTALL_PATH"
 ALTERNATE_SOURCE="$TEST_DIR/alternate-gcp-vault.sh"
 cp "$GCP_VAULT" "$ALTERNATE_SOURCE"
@@ -109,6 +111,13 @@ run_vault install || fail 'install failed'
 [[ $(readlink "$INSTALL_PATH") == "$GCP_VAULT" ]] || fail 'install created the wrong symlink target'
 run_vault install || fail 'idempotent install failed'
 HOME="$HOME_DIR" PATH="$TEST_DIR/bin:$PATH" "$INSTALL_PATH" list >/dev/null || fail 'installed symlink was not executable'
+
+rm "$INSTALL_PATH"
+printf 'occupied\n' > "$INSTALL_PATH"
+if output=$(run_vault install --replace 2>&1); then fail 'explicit replacement overwrote a regular file'; fi
+assert_contains "$output" 'refusing to overwrite existing file'
+rm "$INSTALL_PATH"
+run_vault install || fail 'install after regular-file replacement test failed'
 
 # shellcheck disable=SC2016
 output=$(run_vault mama -- bash -c 'printf "%s|%s|%s|%s|%s|%s" "$CLOUDSDK_CONFIG" "$CLOUDSDK_CORE_ACCOUNT" "$GOOGLE_APPLICATION_CREDENTIALS" "$GCP_VAULT_ACCOUNT" "$GCP_VAULT_EXPECTED_ACCOUNT" "$GCP_VAULT_ALLOWED_PROJECTS"')

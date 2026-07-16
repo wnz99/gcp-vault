@@ -27,6 +27,15 @@ git clone https://github.com/wnz99/gcp-vault.git "$HOME/.local/share/gcp-vault"
 Ensure `$HOME/.local/bin` is on `PATH`. The installer refuses to overwrite an unrelated file or
 symlink.
 
+If migrating from a previously vendored copy whose installed symlink points somewhere else, use
+the explicit symlink-only replacement mode:
+
+```bash
+"$HOME/.local/share/gcp-vault/gcp-vault" install --replace
+```
+
+`--replace` still refuses to overwrite a regular file.
+
 To update:
 
 ```bash

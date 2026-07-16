@@ -15,7 +15,7 @@ readonly SCRIPT_DIR SCRIPT_PATH
 readonly INSTALL_PATH="${HOME}/.local/bin/gcp-vault"
 
 die() { printf 'gcp-vault: %s\n' "$*" >&2; exit 1; }
-usage() { printf 'Usage: gcp-vault install\n       gcp-vault list\n       gcp-vault login <account>\n       gcp-vault <account> [--] <command...>\n' >&2; exit 2; }
+usage() { printf 'Usage: gcp-vault install [--replace]\n       gcp-vault list\n       gcp-vault login <account>\n       gcp-vault <account> [--] <command...>\n' >&2; exit 2; }
 
 resolve_path() {
   local path=$1 path_dir
@@ -29,11 +29,16 @@ resolve_path() {
 }
 
 install_wrapper() {
-  local target canonical_target
+  local replace=${1:-false} target canonical_target
 
   mkdir -p "$(dirname "$INSTALL_PATH")"
   if [[ -e $INSTALL_PATH || -L $INSTALL_PATH ]]; then
     [[ -L $INSTALL_PATH ]] || die "refusing to overwrite existing file: $INSTALL_PATH"
+    if [[ $replace == true ]]; then
+      rm "$INSTALL_PATH"
+      ln -s "$SCRIPT_PATH" "$INSTALL_PATH"
+      return
+    fi
     target=$(readlink "$INSTALL_PATH")
     [[ $target == /* ]] || target="$(dirname "$INSTALL_PATH")/$target"
     canonical_target=$(resolve_path "$target") || true
@@ -107,7 +112,13 @@ reject_credential_overrides() {
 main() {
   local alias config_file authenticated_account adc_file adc_token adc_email mode=run
   (($# > 0)) || usage
-  if [[ $1 == install ]]; then (($# == 1)) || usage; install_wrapper; return; fi
+  if [[ $1 == install ]]; then
+    if (($# == 1)); then install_wrapper
+    elif (($# == 2)) && [[ $2 == --replace ]]; then install_wrapper true
+    else usage
+    fi
+    return
+  fi
   require_installed_wrapper
   if [[ $1 == list ]]; then (($# == 1)) || usage; list_accounts; return; fi
   if [[ $1 == login ]]; then
