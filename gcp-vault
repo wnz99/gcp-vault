@@ -144,8 +144,11 @@ main() {
 
   export CLOUDSDK_CONFIG="$cloudsdk_config" CLOUDSDK_CORE_ACCOUNT="$expected_account"
   if [[ $mode == login ]]; then
+    printf 'gcp-vault: Google Cloud CLI may ask for the Google Workspace password for %s.\n' "$expected_account"
+    printf 'gcp-vault: This is not your macOS login, Keychain, aws-vault, or gcp-vault password.\n'
+    printf 'gcp-vault: If offered, browser reauthentication is also valid.\n'
     gcloud auth login "$expected_account" || die "gcloud account login failed: $expected_account"
-    gcloud auth application-default login "$expected_account" || die "ADC login failed: $expected_account"
+    gcloud auth application-default login || die "ADC login failed: $expected_account"
   fi
 
   [[ -f $adc_file && ! -L $adc_file ]] || die "ADC file not found or unsafe for account: $alias"

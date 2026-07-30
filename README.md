@@ -79,7 +79,10 @@ gcp-vault login example
 ```
 
 This runs the Cloud SDK account login and ADC login inside the alias's isolated profile, then
-validates that both tokens resolve to `expected_account`.
+validates that both tokens resolve to `expected_account`. If Google Cloud CLI displays
+`Please enter your password:`, it is asking for the Google Workspace password for the configured
+account. It is not asking for the macOS login, Keychain, `aws-vault`, or `gcp-vault` password;
+browser reauthentication is also valid when Google offers it.
 
 ## Run commands
 
@@ -108,7 +111,7 @@ For a single-account workstation, Google Cloud's standard local workflow is:
 ```bash
 gcloud auth login you@example.com
 gcloud config set project example-dev
-gcloud auth application-default login you@example.com
+gcloud auth application-default login
 ```
 
 Then run commands directly:
