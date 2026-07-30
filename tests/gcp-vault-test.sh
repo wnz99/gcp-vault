@@ -26,7 +26,7 @@ case "$*" in
     printf '%s\n' named-login >> "$FAKE_GCLOUD_LOG"
     [[ ${FAKE_NAMED_LOGIN_FAIL:-0} != 1 ]] || exit 1
     ;;
-  'auth application-default login mama@example.com')
+  'auth application-default login')
     [[ ${GOOGLE_APPLICATION_CREDENTIALS+x} != x ]] || exit 87
     printf '%s\n' adc-login >> "$FAKE_GCLOUD_LOG"
     [[ ${FAKE_ADC_LOGIN_FAIL:-0} != 1 ]] || exit 1
@@ -131,6 +131,8 @@ output=$(run_vault mama bash -c 'printf "<%s><%s><%s>" "$1" "$2" "$3"' _ 'space 
 rm -f "$TEST_DIR/gcloud.log"
 output=$(run_vault login mama)
 assert_contains "$output" 'authenticated account mama@example.com for alias mama'
+assert_contains "$output" 'Google Workspace password for mama@example.com'
+assert_contains "$output" 'not your macOS login, Keychain, aws-vault, or gcp-vault password'
 [[ $(<"$TEST_DIR/gcloud.log") == $'named-login\nadc-login' ]] || fail 'login did not refresh named and ADC credentials in order'
 if (export FAKE_NAMED_LOGIN_FAIL=1; run_vault login mama) >"$TEST_DIR/out" 2>&1; then fail 'named login failure was accepted'; fi
 assert_contains "$(<"$TEST_DIR/out")" 'gcloud account login failed'
