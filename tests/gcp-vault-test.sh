@@ -5,6 +5,8 @@ TEST_DIR=$(mktemp -d)
 TEST_DIR=$(cd "$TEST_DIR" && pwd -P); readonly TEST_DIR
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd); readonly REPO_ROOT
 readonly GCP_VAULT="$REPO_ROOT/gcp-vault"
+REAL_JQ=$(command -v jq); readonly REAL_JQ; export REAL_JQ
+REAL_FIND=$(command -v find); readonly REAL_FIND; export REAL_FIND
 trap 'rm -rf "$TEST_DIR"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 assert_contains() { [[ $1 == *"$2"* ]] || fail "expected output to contain: $2"; }
@@ -12,7 +14,11 @@ assert_contains() { [[ $1 == *"$2"* ]] || fail "expected output to contain: $2";
 HOME_DIR="$TEST_DIR/home"; PROFILE="$HOME_DIR/.config/gcloud-mama"; ACCOUNTS="$HOME_DIR/.config/gcp-vault/accounts"
 mkdir -p "$TEST_DIR/bin" "$PROFILE" "$ACCOUNTS"
 printf '{}\n' > "$PROFILE/application_default_credentials.json"
-write_config() { printf 'cloudsdk_config=%s\nexpected_account=%s\nallowed_projects=%s\n' "${1:-$PROFILE}" "${2:-mama@example.com}" "${3:-mama-dev,mama-stg,mama-prd}" > "$ACCOUNTS/${4:-mama}"; }
+write_config() {
+  printf 'cloudsdk_config=%s\n' "${1:-$PROFILE}" > "$ACCOUNTS/${4:-mama}"
+  [[ -z ${5:-} ]] || printf 'description=%s\n' "$5" >> "$ACCOUNTS/${4:-mama}"
+  printf 'expected_account=%s\nallowed_projects=%s\n' "${2:-mama@example.com}" "${3:-mama-dev,mama-stg,mama-prd}" >> "$ACCOUNTS/${4:-mama}"
+}
 write_config
 
 cat > "$TEST_DIR/bin/gcloud" <<'EOF'
@@ -62,12 +68,22 @@ EOF
 cat > "$TEST_DIR/bin/jq" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ ${1:-} == -cn ]]; then exec "$REAL_JQ" "$@"; fi
 [[ "$*" == '-er .email' ]] || { printf 'bad jq argv: <%s>\n' "$*" >&2; exit 95; }
 IFS= read -r input
 [[ $input == *'"email"'* ]] || { printf 'bad jq input: <%s>\n' "$input" >&2; exit 1; }
 printf '%s\n' "${FAKE_ADC_EMAIL:-mama@example.com}"
 EOF
-chmod +x "$TEST_DIR/bin/"{gcloud,curl,jq}
+cat > "$TEST_DIR/bin/find" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${FAKE_FIND_FAIL:-0} == 1 ]]; then
+  printf 'find leaked-secret-content\n' >&2
+  exit 73
+fi
+exec "$REAL_FIND" "$@"
+EOF
+chmod +x "$TEST_DIR/bin/"{gcloud,curl,jq,find}
 
 run_vault() {
   env -u GOOGLE_CREDENTIALS -u GOOGLE_APPLICATION_CREDENTIALS -u GOOGLE_BACKEND_CREDENTIALS \
@@ -77,6 +93,26 @@ run_vault() {
     PATH="$TEST_DIR/bin:$PATH" HOME="$HOME_DIR" FAKE_PROFILE="$PROFILE" \
     FAKE_GCLOUD_LOG="$TEST_DIR/gcloud.log" "$GCP_VAULT" "$@"
 }
+
+assert_status() {
+  local expected=$1; shift
+  set +e
+  "$@" >"$TEST_DIR/stdout" 2>"$TEST_DIR/stderr"
+  local actual=$?
+  set -e
+  [[ $actual == "$expected" ]] || fail "expected status $expected, got $actual for: $*"
+}
+
+# Help is available before installation and is stdout-only.
+for help_arg in help --help; do
+  assert_status 0 run_vault "$help_arg"
+  [[ ! -s $TEST_DIR/stderr ]] || fail "$help_arg wrote stderr"
+  for phrase in 'list --json' 'describe <alias>' 'cloudsdk_config' 'description' 'expected_account' 'allowed_projects' 'GCP_VAULT_ACCOUNT' 'never put secrets' 'native gcloud' 'exactly one alias'; do
+    assert_contains "$(<"$TEST_DIR/stdout")" "$phrase"
+  done
+done
+assert_status 2 run_vault help extra
+[[ ! -s $TEST_DIR/stdout ]] || fail 'invalid help usage wrote stdout'
 
 INSTALL_PATH="$HOME_DIR/.local/bin/gcp-vault"
 if output=$(run_vault list 2>&1); then fail 'list accepted a missing installation'; fi
@@ -127,6 +163,87 @@ output=$(run_vault mama bash -c 'printf "<%s><%s><%s>" "$1" "$2" "$3"' _ 'space 
 # shellcheck disable=SC2016
 [[ $output == '<space arg><*><$(no-exec)>' ]] || fail 'command arguments were not preserved'
 [[ $(run_vault list) == mama ]] || fail 'list did not print aliases only'
+
+# Inspection accepts optional descriptions and emits exact allowlisted contracts.
+write_config "$PROFILE" mama@example.com 'mama-prd,mama-dev' zeta 'Production "primary" \ team'
+write_config "$PROFILE" mama@example.com mama-stg Alpha
+expected_json='[{"alias":"Alpha","description":null,"expected_account":"mama@example.com","allowed_projects":["mama-stg"]},{"alias":"mama","description":null,"expected_account":"mama@example.com","allowed_projects":["mama-dev","mama-stg","mama-prd"]},{"alias":"zeta","description":"Production \"primary\" \\ team","expected_account":"mama@example.com","allowed_projects":["mama-prd","mama-dev"]}]'
+assert_status 0 run_vault list --json
+[[ $(<"$TEST_DIR/stdout") == "$expected_json" ]] || fail "JSON inventory mismatch: $(<"$TEST_DIR/stdout")"
+[[ ! -s $TEST_DIR/stderr ]] || fail 'list --json wrote stderr'
+assert_status 0 run_vault describe zeta
+[[ $(<"$TEST_DIR/stdout") == $'alias: zeta\ndescription: Production "primary" \\ team\nexpected_account: mama@example.com\nallowed_projects: mama-prd,mama-dev' ]] || fail 'describe output mismatch'
+[[ ! -s $TEST_DIR/stderr ]] || fail 'describe wrote stderr'
+[[ $(run_vault describe Alpha) == $'alias: Alpha\ndescription: <none>\nexpected_account: mama@example.com\nallowed_projects: mama-stg' ]] || fail 'legacy describe mismatch'
+rm "$ACCOUNTS/Alpha" "$ACCOUNTS/zeta"
+
+# Empty JSON inventory is exact, while legacy list behavior remains unchanged.
+mv "$ACCOUNTS/mama" "$TEST_DIR/mama-config"
+[[ $(run_vault list --json) == '[]' ]] || fail 'empty JSON inventory mismatch'
+mv "$TEST_DIR/mama-config" "$ACCOUNTS/mama"
+
+# Inspection fails closed on every unsafe direct entry and never emits a partial inventory.
+mkdir "$ACCOUNTS/directory"
+assert_status 1 run_vault list --json
+[[ ! -s $TEST_DIR/stdout ]] || fail 'unsafe JSON inventory emitted partial stdout'
+rm -r "$ACCOUNTS/directory"
+ln -s mama "$ACCOUNTS/symlink"
+assert_status 1 run_vault list --json
+[[ ! -s $TEST_DIR/stdout ]] || fail 'symlink JSON inventory emitted partial stdout'
+rm "$ACCOUNTS/symlink"
+printf 'x' > "$ACCOUNTS/bad alias"
+assert_status 1 run_vault list --json
+[[ ! -s $TEST_DIR/stdout ]] || fail 'unsafe alias emitted partial stdout'
+rm "$ACCOUNTS/bad alias"
+
+# A traversal failure is detected before parsing and emits only a sanitized error.
+mkdir "$TEST_DIR/list-tmp"
+run_vault_find_failure() { FAKE_FIND_FAIL=1 TMPDIR="$TEST_DIR/list-tmp" run_vault "$@"; }
+assert_status 1 run_vault_find_failure list --json
+[[ ! -s $TEST_DIR/stdout ]] || fail 'failed traversal emitted JSON stdout'
+assert_contains "$(<"$TEST_DIR/stderr")" 'failed to enumerate account configs'
+[[ "$(<"$TEST_DIR/stderr")" != *leaked-secret-content* ]] || fail 'failed traversal leaked find stderr'
+[[ -z $(find "$TEST_DIR/list-tmp" -mindepth 1 -maxdepth 1 -print -quit) ]] || fail 'failed traversal left temporary artifacts'
+
+# Describe validates arity and aliases before path construction.
+for args in 'describe' 'describe mama extra' 'list --yaml'; do
+  read -r -a argv <<< "$args"
+  assert_status 2 run_vault "${argv[@]}"
+done
+assert_status 1 run_vault describe '../mama'
+[[ ! -s $TEST_DIR/stdout ]] || fail 'unsafe describe wrote stdout'
+assert_contains "$(<"$TEST_DIR/stderr")" 'unsafe account alias'
+
+# Inspection parser diagnostics never reproduce hostile keys or values.
+printf 'cloudsdk_config=%s\nexpected_account=mama@example.com\nallowed_projects=mama-dev\nGOOGLE_OAUTH_ACCESS_TOKEN=super-secret-token\n' "$PROFILE" > "$ACCOUNTS/hostile"
+assert_status 1 run_vault list --json
+[[ ! -s $TEST_DIR/stdout ]] || fail 'malformed JSON inventory emitted partial stdout'
+assert_status 1 run_vault describe hostile
+combined="$(<"$TEST_DIR/stdout")$(<"$TEST_DIR/stderr")"
+[[ $combined != *GOOGLE_OAUTH_ACCESS_TOKEN* && $combined != *super-secret-token* ]] || fail 'describe leaked hostile config content'
+assert_contains "$combined" 'invalid account config: unknown field'
+rm "$ACCOUNTS/hostile"
+
+printf 'cloudsdk_config=%s\ndescription=one\ndescription=secret-description\nexpected_account=mama@example.com\nallowed_projects=mama-dev\n' "$PROFILE" > "$ACCOUNTS/duplicate"
+assert_status 1 run_vault describe duplicate
+[[ "$(<"$TEST_DIR/stderr")" != *secret-description* ]] || fail 'duplicate description leaked value'
+rm "$ACCOUNTS/duplicate"
+
+printf 'cloudsdk_config=%s\ndescription=\nexpected_account=mama@example.com\nallowed_projects=mama-dev\n' "$PROFILE" > "$ACCOUNTS/empty-description"
+assert_status 1 run_vault describe empty-description
+assert_contains "$(<"$TEST_DIR/stderr")" 'invalid account config: empty description'
+rm "$ACCOUNTS/empty-description"
+
+# Descriptions permit only ASCII printable bytes; control content is never echoed.
+for encoded_description in $'C1-secret-\302\233-tail' $'Unicode-secret-\342\200\256-tail'; do
+  printf 'cloudsdk_config=%s\ndescription=%s\nexpected_account=mama@example.com\nallowed_projects=mama-dev\n' \
+    "$PROFILE" "$encoded_description" > "$ACCOUNTS/control-description"
+  assert_status 1 run_vault describe control-description
+  [[ ! -s $TEST_DIR/stdout ]] || fail 'control description wrote stdout'
+  assert_contains "$(<"$TEST_DIR/stderr")" 'invalid account config: malformed description'
+  [[ "$(<"$TEST_DIR/stderr")" != *secret* ]] || fail 'control description leaked content'
+done
+rm "$ACCOUNTS/control-description"
 
 rm -f "$TEST_DIR/gcloud.log"
 output=$(run_vault login mama)

@@ -15,7 +15,31 @@ readonly SCRIPT_DIR SCRIPT_PATH
 readonly INSTALL_PATH="${HOME}/.local/bin/gcp-vault"
 
 die() { printf 'gcp-vault: %s\n' "$*" >&2; exit 1; }
-usage() { printf 'Usage: gcp-vault install [--replace]\n       gcp-vault list\n       gcp-vault login <account>\n       gcp-vault <account> [--] <command...>\n' >&2; exit 2; }
+usage_text() {
+  cat <<'EOF'
+Usage: gcp-vault install [--replace]
+       gcp-vault list [--json]
+       gcp-vault describe <alias>
+       gcp-vault login <alias>
+       gcp-vault <alias> [--] <command...>
+
+Install the repository script with `gcp-vault install`, then configure account
+files containing cloudsdk_config, optional description, expected_account, and
+allowed_projects. Authenticate with `gcp-vault login <alias>`.
+
+Use `list` for alias-only output, `list --json` for machine-readable metadata,
+and `describe <alias>` for focused inspection. Automatic selection is safe only
+when exactly one alias unambiguously matches its description, expected account,
+and allowed projects; ask when metadata is missing, conflicting, or ambiguous.
+Descriptions are operator-authored labels: never put secrets or credentials in
+them. Run commands as `gcp-vault <alias> -- <command...>`; child commands receive
+the invocation-scoped current alias in GCP_VAULT_ACCOUNT.
+
+Without gcp-vault, use native gcloud: `gcloud auth login`, select a project, and
+run `gcloud auth application-default login`.
+EOF
+}
+usage() { usage_text >&2; exit 2; }
 
 resolve_path() {
   local path=$1 path_dir
@@ -71,27 +95,87 @@ list_accounts() {
   while IFS= read -r -d '' path; do basename "$path"; done < <(find "$CONFIG_DIR" -maxdepth 1 -type f -print0 | sort -z)
 }
 
+require_config_dir() {
+  [[ -d $CONFIG_DIR && ! -L $CONFIG_DIR ]] || die 'account config directory is missing or unsafe'
+  [[ $(cd "$CONFIG_DIR" && pwd -P) == "$CONFIG_DIR" ]] || die 'account config directory must be canonical'
+}
+
+list_accounts_json() {
+  local path alias object entries='[]' inventory_dir unsorted_inventory sorted_inventory
+  require_config_dir
+  inventory_dir=$(mktemp -d "${TMPDIR:-/tmp}/gcp-vault-list.XXXXXXXXXX") || die 'failed to enumerate account configs'
+  trap 'rm -rf -- "${inventory_dir:?}"' EXIT
+  chmod 700 "$inventory_dir" || die 'failed to enumerate account configs'
+  unsorted_inventory="$inventory_dir/unsorted"
+  sorted_inventory="$inventory_dir/sorted"
+  # Complete traversal and sorting in this shell before parsing any configs. This
+  # guarantees traversal failures cannot yield a partial or apparently-valid inventory.
+  if ! find "$CONFIG_DIR" -mindepth 1 -maxdepth 1 -print0 >"$unsorted_inventory" 2>/dev/null ||
+     ! LC_ALL=C sort -z "$unsorted_inventory" >"$sorted_inventory" 2>/dev/null; then
+    die 'failed to enumerate account configs'
+  fi
+  while IFS= read -r -d '' path; do
+    alias=$(basename "$path")
+    validate_alias_inspection "$alias"
+    [[ -f $path && ! -L $path ]] || die 'unsafe account config entry'
+    load_config "$path" inspection
+    object=$(jq -cn --arg alias "$alias" --arg description "$description" \
+      --arg expected_account "$expected_account" --arg allowed_projects "$allowed_projects" \
+      --argjson has_description "$description_present" \
+      '{alias:$alias,description:(if $has_description then $description else null end),expected_account:$expected_account,allowed_projects:($allowed_projects|split(","))}') || die 'failed to encode account metadata'
+    entries=$(jq -cn --argjson entries "$entries" --argjson object "$object" '$entries + [$object]') || die 'failed to encode account metadata'
+  done < "$sorted_inventory"
+  rm -rf -- "$inventory_dir"
+  trap - EXIT
+  printf '%s\n' "$entries"
+}
+
+validate_alias_inspection() {
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $1 != '.' && $1 != '..' ]] || die 'unsafe account alias'
+}
+
+describe_account() {
+  local alias=$1 config_file
+  validate_alias_inspection "$alias"
+  require_config_dir
+  config_file="$CONFIG_DIR/$alias"
+  [[ -f $config_file && ! -L $config_file ]] || die 'account config not found or unsafe'
+  load_config "$config_file" inspection
+  printf 'alias: %s\ndescription: %s\nexpected_account: %s\nallowed_projects: %s\n' \
+    "$alias" "${description:-<none>}" "$expected_account" "$allowed_projects"
+}
+
 load_config() {
-  local config_file=$1 line key value canonical base
-  local seen_cloudsdk_config=false seen_expected_account=false seen_allowed_projects=false
-  cloudsdk_config=''; expected_account=''; allowed_projects=''
-  [[ ! -L $config_file ]] || die 'account config must not be a symlink'
+  local config_file=$1 error_mode=${2:-execution} line key value canonical base
+  local seen_cloudsdk_config=false seen_description=false seen_expected_account=false seen_allowed_projects=false
+  cloudsdk_config=''; description=''; description_present=false; expected_account=''; allowed_projects=''
+  config_error() {
+    if [[ $error_mode == inspection ]]; then die "invalid account config: $1"; else die "$2"; fi
+  }
+  [[ ! -L $config_file ]] || config_error 'unsafe file' 'account config must not be a symlink'
   while IFS= read -r line || [[ -n $line ]]; do
-    [[ $line != *$'\r'* && $line != *[$'\001'-$'\037'$'\177']* ]] || die 'malformed config: control character'
-    [[ -n $line && $line == *=* ]] || die 'malformed config: expected key=value'
+    [[ $line != *$'\r'* && $line != *[$'\001'-$'\037'$'\177']* ]] || config_error 'control character' 'malformed config: control character'
+    [[ -n $line && $line == *=* ]] || config_error 'record format' 'malformed config: expected key=value'
     key=${line%%=*}; value=${line#*=}
-    case $key in cloudsdk_config|expected_account|allowed_projects) ;; *) die "unknown config key: $key" ;; esac
+    case $key in cloudsdk_config|description|expected_account|allowed_projects) ;; *) config_error 'unknown field' "unknown config key: $key" ;; esac
     case $key in
-      cloudsdk_config) [[ $seen_cloudsdk_config == false ]] || die "duplicate config key: $key"; seen_cloudsdk_config=true ;;
-      expected_account) [[ $seen_expected_account == false ]] || die "duplicate config key: $key"; seen_expected_account=true ;;
-      allowed_projects) [[ $seen_allowed_projects == false ]] || die "duplicate config key: $key"; seen_allowed_projects=true ;;
+      cloudsdk_config) [[ $seen_cloudsdk_config == false ]] || config_error 'duplicate cloudsdk_config' "duplicate config key: $key"; seen_cloudsdk_config=true ;;
+      description) [[ $seen_description == false ]] || config_error 'duplicate description' "duplicate config key: $key"; seen_description=true ;;
+      expected_account) [[ $seen_expected_account == false ]] || config_error 'duplicate expected_account' "duplicate config key: $key"; seen_expected_account=true ;;
+      allowed_projects) [[ $seen_allowed_projects == false ]] || config_error 'duplicate allowed_projects' "duplicate config key: $key"; seen_allowed_projects=true ;;
     esac
-    [[ -n $value ]] || die "empty config value: $key"
+    [[ -n $value ]] || config_error "empty $key" "empty config value: $key"
     printf -v "$key" '%s' "$value"
   done < "$config_file"
   [[ $seen_cloudsdk_config == true ]] || die 'missing config key: cloudsdk_config'
   [[ $seen_expected_account == true ]] || die 'missing config key: expected_account'
   [[ $seen_allowed_projects == true ]] || die 'missing config key: allowed_projects'
+  if [[ $seen_description == true ]]; then
+    description_present=true
+    # Descriptions are deliberately limited to ASCII printable bytes (0x20-0x7e),
+    # excluding every C0/C1/Unicode control and avoiding terminal escape ambiguity.
+    [[ $description != *[!\ -~]* ]] || config_error 'malformed description' 'malformed description'
+  fi
 
   [[ $cloudsdk_config == /* && $cloudsdk_config != *'/../'* && $cloudsdk_config != */.. && $cloudsdk_config != *'/./'* && $cloudsdk_config != */. ]] || die 'unsafe cloudsdk_config path'
   [[ -d $cloudsdk_config && ! -L $cloudsdk_config ]] || die 'unsafe cloudsdk_config path'
@@ -112,6 +196,7 @@ reject_credential_overrides() {
 main() {
   local alias config_file authenticated_account adc_file adc_token adc_email mode=run
   (($# > 0)) || usage
+  if [[ $1 == help || $1 == --help ]]; then (($# == 1)) || usage; usage_text; return; fi
   if [[ $1 == install ]]; then
     if (($# == 1)); then install_wrapper
     elif (($# == 2)) && [[ $2 == --replace ]]; then install_wrapper true
@@ -120,7 +205,14 @@ main() {
     return
   fi
   require_installed_wrapper
-  if [[ $1 == list ]]; then (($# == 1)) || usage; list_accounts; return; fi
+  if [[ $1 == list ]]; then
+    if (($# == 1)); then list_accounts
+    elif (($# == 2)) && [[ $2 == --json ]]; then list_accounts_json
+    else usage
+    fi
+    return
+  fi
+  if [[ $1 == describe ]]; then (($# == 2)) || usage; describe_account "$2"; return; fi
   if [[ $1 == login ]]; then
     (($# == 2)) || usage
     mode=login
@@ -135,8 +227,7 @@ main() {
   command -v gcloud >/dev/null || die 'gcloud is required'
   command -v curl >/dev/null || die 'curl is required'
   command -v jq >/dev/null || die 'jq is required'
-  [[ -d $CONFIG_DIR && ! -L $CONFIG_DIR ]] || die 'account config directory is missing or unsafe'
-  [[ $(cd "$CONFIG_DIR" && pwd -P) == "$CONFIG_DIR" ]] || die 'account config directory must be canonical'
+  require_config_dir
   config_file="$CONFIG_DIR/$alias"
   [[ -f $config_file && ! -L $config_file ]] || die "account config not found: $alias"
   load_config "$config_file"
