@@ -53,6 +53,7 @@ mkdir -p "$HOME/.config/gcp-vault/accounts" "$HOME/.config/gcloud-example"
 
 cat > "$HOME/.config/gcp-vault/accounts/example" <<EOF
 cloudsdk_config=$HOME/.config/gcloud-example
+description=Example organization development and production
 expected_account=you@example.com
 allowed_projects=example-dev,example-stg,example-prd
 EOF
@@ -61,6 +62,8 @@ EOF
 Configuration files accept exactly these keys:
 
 - `cloudsdk_config`: absolute, canonical Cloud SDK directory under `~/.config/gcloud*`.
+- `description`: optional, non-empty printable ASCII operator-authored label. Never put secrets,
+  credentials, or token material in a description.
 - `expected_account`: Google account that both gcloud and ADC must use.
 - `allowed_projects`: comma-separated Google Cloud project IDs exposed to child commands.
 
@@ -68,7 +71,13 @@ List configured aliases:
 
 ```bash
 gcp-vault list
+gcp-vault list --json
+gcp-vault describe example
 ```
+
+Plain `list` remains alias-only. JSON discovery and `describe` expose only the alias, description,
+expected account, and allowed projects. Select an alias automatically only when exactly one entry
+clearly matches the task; ask when metadata is missing, conflicting, or ambiguous.
 
 ## Authenticate
 
@@ -103,6 +112,8 @@ The wrapper exports these validated values only to the child process:
 
 It rejects pre-existing credential, account, impersonation, and access-token overrides to prevent
 ambient state from bypassing profile isolation.
+`GCP_VAULT_ACCOUNT` is the current alias only for the invoked child command; there is no durable
+global current alias.
 
 ## Vanilla gcloud alternative
 
