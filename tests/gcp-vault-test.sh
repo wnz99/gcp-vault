@@ -54,6 +54,27 @@ case "$*" in
     ;;
   *) exit 85 ;;
 esac
+if [[ ${FAKE_CHECK_BROWSER:-0} == 1 ]]; then
+  case "$*" in
+    'auth login mama@example.com'|'auth application-default login')
+      python3 - <<'PY'
+import os, time, webbrowser
+from pathlib import Path
+assert webbrowser.open('https://accounts.google.com/o/oauth2/auth?state=a%20b&code=x', new=1)
+expected = len(Path(os.environ['FAKE_GCLOUD_LOG']).read_text().splitlines())
+for _ in range(200):
+    path = Path(os.environ['FAKE_BROWSER_LOG'])
+    if path.exists() and len(path.read_text().splitlines()) == expected:
+        break
+    time.sleep(0.01)
+else:
+    raise AssertionError('browser did not receive both login URLs')
+Path(os.environ['FAKE_LAUNCHER_LOG']).write_text(os.environ['BROWSER'])
+PY
+      ;;
+    *) [[ ${BROWSER:-} == "$FAKE_BROWSER_AMBIENT" ]] || exit 88 ;;
+  esac
+fi
 EOF
 cat > "$TEST_DIR/bin/curl" <<'EOF'
 #!/usr/bin/env bash
@@ -85,12 +106,27 @@ exec "$REAL_FIND" "$@"
 EOF
 chmod +x "$TEST_DIR/bin/"{gcloud,curl,jq,find}
 
+cat > "$TEST_DIR/bin/uname" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "${FAKE_PLATFORM:-Linux}"
+EOF
+cat > "$TEST_DIR/bin/browser-stub" <<'EOF'
+#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ['FAKE_BROWSER_LOG'], 'a') as log:
+    log.write(json.dumps([os.path.basename(sys.argv[0])] + sys.argv[1:]) + '\n')
+EOF
+chmod +x "$TEST_DIR/bin/"{uname,browser-stub}
+for browser_binary in google-chrome firefox brave-browser open; do
+  ln -s browser-stub "$TEST_DIR/bin/$browser_binary"
+done
+
 run_vault() {
   env -u GOOGLE_CREDENTIALS -u GOOGLE_APPLICATION_CREDENTIALS -u GOOGLE_BACKEND_CREDENTIALS \
     -u GOOGLE_OAUTH_ACCESS_TOKEN -u GOOGLE_IMPERSONATE_SERVICE_ACCOUNT -u GOOGLE_BACKEND_IMPERSONATE_SERVICE_ACCOUNT \
     -u CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE -u CLOUDSDK_AUTH_ACCESS_TOKEN -u CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT \
     -u CLOUDSDK_CONFIG -u CLOUDSDK_CORE_ACCOUNT -u GCP_VAULT_ACCOUNT \
-    PATH="$TEST_DIR/bin:$PATH" HOME="$HOME_DIR" FAKE_PROFILE="$PROFILE" \
+    PATH="${VAULT_TEST_PATH:-$TEST_DIR/bin:$PATH}" HOME="$HOME_DIR" FAKE_PROFILE="$PROFILE" \
     FAKE_GCLOUD_LOG="$TEST_DIR/gcloud.log" "$GCP_VAULT" "$@"
 }
 
@@ -255,6 +291,92 @@ if (export FAKE_NAMED_LOGIN_FAIL=1; run_vault login mama) >"$TEST_DIR/out" 2>&1;
 assert_contains "$(<"$TEST_DIR/out")" 'gcloud account login failed'
 if (export FAKE_ADC_LOGIN_FAIL=1; run_vault login mama) >"$TEST_DIR/out" 2>&1; then fail 'ADC login failure was accepted'; fi
 assert_contains "$(<"$TEST_DIR/out")" 'ADC login failed'
+
+# Exercise Python webbrowser's real BROWSER parsing, including literal metacharacters,
+# both login flows, native platform arguments, cleanup, and override scope.
+browser_url='https://accounts.google.com/o/oauth2/auth?state=a%20b&code=x'
+# jq expressions and config payloads are literal.
+# shellcheck disable=SC2016
+for platform in Linux Darwin; do
+  mkdir -p "$HOME_DIR/Applications/Google Chrome.app" "$HOME_DIR/Applications/Firefox.app" "$HOME_DIR/Applications/Brave Browser.app"
+  for selected_browser in chrome firefox brave; do
+    write_config
+    printf 'browser=%s\n' "$selected_browser" >> "$ACCOUNTS/mama"
+    # shellcheck disable=SC2016
+    selected_profile='Work : %s "quoted" $(touch should-not-exist)'
+    printf 'browser_profile=%s\n' "$selected_profile" >> "$ACCOUNTS/mama"
+    rm -f "$TEST_DIR/gcloud.log" "$TEST_DIR/browser.log" "$TEST_DIR/launcher.log"
+    FAKE_PLATFORM="$platform" FAKE_CHECK_BROWSER=1 FAKE_BROWSER_LOG="$TEST_DIR/browser.log" \
+      FAKE_LAUNCHER_LOG="$TEST_DIR/launcher.log" FAKE_BROWSER_AMBIENT='ambient-browser' \
+      BROWSER='ambient-browser' run_vault login mama >"$TEST_DIR/out"
+    case $selected_browser in
+      chrome) binary=google-chrome; app='Google Chrome.app' ;;
+      firefox) binary=firefox; app='Firefox.app' ;;
+      brave) binary=brave-browser; app='Brave Browser.app' ;;
+    esac
+    if [[ $selected_browser == firefox ]]; then
+      profile_args=$("$REAL_JQ" -cn --arg profile "$selected_profile" '["-no-remote","-P",$profile]')
+    else
+      profile_args=$("$REAL_JQ" -cn --arg profile "$selected_profile" '["--profile-directory="+$profile]')
+    fi
+    prefix=$("$REAL_JQ" -cn --arg binary "$binary" '[$binary]')
+    if [[ $platform == Darwin ]]; then
+      prefix=$("$REAL_JQ" -cn --arg app "$HOME_DIR/Applications/$app" '["open","-n","-a",$app,"--args"]')
+    fi
+    expected=$("$REAL_JQ" -cn --argjson prefix "$prefix" --argjson profile "$profile_args" --arg url "$browser_url" '$prefix + $profile + [$url]')
+    [[ $("$REAL_JQ" -sc '.' "$TEST_DIR/browser.log") == "[$expected,$expected]" ]] || fail "$platform $selected_browser received incorrect arguments"
+    launcher=$(<"$TEST_DIR/launcher.log"); launcher=${launcher% %s}
+    [[ ! -e ${launcher%/*} ]] || fail 'successful login left browser launcher behind'
+  done
+done
+
+# Browser-only selection omits profile flags; ordinary commands preserve ambient BROWSER.
+write_config
+printf 'browser=chrome\n' >> "$ACCOUNTS/mama"
+rm -f "$TEST_DIR/gcloud.log" "$TEST_DIR/browser.log"
+FAKE_CHECK_BROWSER=1 FAKE_BROWSER_LOG="$TEST_DIR/browser.log" FAKE_LAUNCHER_LOG="$TEST_DIR/launcher.log" \
+  FAKE_BROWSER_AMBIENT='ambient-browser' BROWSER='ambient-browser' run_vault login mama >/dev/null
+# jq expands $url.
+# shellcheck disable=SC2016
+expected=$("$REAL_JQ" -cn --arg url "$browser_url" '["google-chrome",$url]')
+[[ $("$REAL_JQ" -sc '.' "$TEST_DIR/browser.log") == "[$expected,$expected]" ]] || fail 'browser-only login added profile arguments'
+# shellcheck disable=SC2016
+[[ $(BROWSER='ambient-browser' run_vault mama bash -c 'printf "%s" "$BROWSER"') == ambient-browser ]] || fail 'browser config affected child command'
+[[ $(run_vault list --json) == '[{"alias":"mama","description":null,"expected_account":"mama@example.com","allowed_projects":["mama-dev","mama-stg","mama-prd"]}]' ]] || fail 'browser config changed discovery contract'
+
+# Missing browsers fail before either authentication flow; inspection still works.
+mkdir "$TEST_DIR/no-browser-bin"
+for utility in bash dirname basename readlink; do
+  ln -s "$(command -v "$utility")" "$TEST_DIR/no-browser-bin/$utility"
+done
+for utility in gcloud curl jq uname; do
+  ln -s "$TEST_DIR/bin/$utility" "$TEST_DIR/no-browser-bin/$utility"
+done
+rm -f "$TEST_DIR/gcloud.log"
+run_vault_without_browser() { VAULT_TEST_PATH="$TEST_DIR/no-browser-bin" run_vault "$@"; }
+assert_status 1 run_vault_without_browser login mama
+assert_contains "$(<"$TEST_DIR/stderr")" 'configured browser is not installed on PATH: chrome'
+[[ ! -e $TEST_DIR/gcloud.log ]] || fail 'missing browser started authentication'
+assert_status 0 run_vault_without_browser describe mama
+
+# Failed authentication also cleans up the launcher.
+rm -f "$TEST_DIR/gcloud.log" "$TEST_DIR/browser.log"
+if FAKE_ADC_LOGIN_FAIL=1 FAKE_CHECK_BROWSER=1 FAKE_BROWSER_LOG="$TEST_DIR/browser.log" \
+  FAKE_LAUNCHER_LOG="$TEST_DIR/launcher.log" FAKE_BROWSER_AMBIENT='' run_vault login mama >"$TEST_DIR/out" 2>&1; then
+  fail 'configured browser masked ADC failure'
+fi
+launcher=$(<"$TEST_DIR/launcher.log"); launcher=${launcher% %s}
+[[ ! -e ${launcher%/*} ]] || fail 'failed login left browser launcher behind'
+
+for browser_config in 'browser=safari' 'browser_profile=Work' $'browser=chrome\nbrowser=brave' \
+  $'browser=chrome\nbrowser_profile=Work\nbrowser_profile=Other' 'browser=' \
+  $'browser=chrome\nbrowser_profile=../Other'; do
+  write_config
+  printf '%s\n' "$browser_config" >> "$ACCOUNTS/mama"
+  assert_status 1 run_vault login mama
+  assert_status 1 run_vault describe mama
+done
+write_config
 
 for var in GOOGLE_CREDENTIALS GOOGLE_APPLICATION_CREDENTIALS GOOGLE_BACKEND_CREDENTIALS GOOGLE_OAUTH_ACCESS_TOKEN GOOGLE_IMPERSONATE_SERVICE_ACCOUNT GOOGLE_BACKEND_IMPERSONATE_SERVICE_ACCOUNT CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE CLOUDSDK_AUTH_ACCESS_TOKEN CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT CLOUDSDK_CONFIG CLOUDSDK_CORE_ACCOUNT GCP_VAULT_ACCOUNT; do
   if env HOME="$HOME_DIR" PATH="$TEST_DIR/bin:$PATH" "$var=unsafe" "$GCP_VAULT" mama true >"$TEST_DIR/out" 2>&1; then fail "override accepted: $var"; fi

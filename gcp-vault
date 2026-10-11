@@ -25,7 +25,9 @@ Usage: gcp-vault install [--replace]
 
 Install the repository script with `gcp-vault install`, then configure account
 files containing cloudsdk_config, optional description, expected_account, and
-allowed_projects. Authenticate with `gcp-vault login <alias>`.
+allowed_projects. Optional browser (chrome, firefox, brave) and browser_profile
+select the browser for both web login flows. Authenticate with
+`gcp-vault login <alias>`.
 
 Use `list` for alias-only output, `list --json` for machine-readable metadata,
 and `describe <alias>` for focused inspection. Automatic selection is safe only
@@ -148,7 +150,9 @@ describe_account() {
 load_config() {
   local config_file=$1 error_mode=${2:-execution} line key value canonical base
   local seen_cloudsdk_config=false seen_description=false seen_expected_account=false seen_allowed_projects=false
+  local seen_browser=false seen_browser_profile=false
   cloudsdk_config=''; description=''; description_present=false; expected_account=''; allowed_projects=''
+  browser=''; browser_profile=''
   config_error() {
     if [[ $error_mode == inspection ]]; then die "invalid account config: $1"; else die "$2"; fi
   }
@@ -157,12 +161,14 @@ load_config() {
     [[ $line != *$'\r'* && $line != *[$'\001'-$'\037'$'\177']* ]] || config_error 'control character' 'malformed config: control character'
     [[ -n $line && $line == *=* ]] || config_error 'record format' 'malformed config: expected key=value'
     key=${line%%=*}; value=${line#*=}
-    case $key in cloudsdk_config|description|expected_account|allowed_projects) ;; *) config_error 'unknown field' "unknown config key: $key" ;; esac
+    case $key in cloudsdk_config|description|expected_account|allowed_projects|browser|browser_profile) ;; *) config_error 'unknown field' "unknown config key: $key" ;; esac
     case $key in
       cloudsdk_config) [[ $seen_cloudsdk_config == false ]] || config_error 'duplicate cloudsdk_config' "duplicate config key: $key"; seen_cloudsdk_config=true ;;
       description) [[ $seen_description == false ]] || config_error 'duplicate description' "duplicate config key: $key"; seen_description=true ;;
       expected_account) [[ $seen_expected_account == false ]] || config_error 'duplicate expected_account' "duplicate config key: $key"; seen_expected_account=true ;;
       allowed_projects) [[ $seen_allowed_projects == false ]] || config_error 'duplicate allowed_projects' "duplicate config key: $key"; seen_allowed_projects=true ;;
+      browser) [[ $seen_browser == false ]] || config_error 'duplicate browser' "duplicate config key: $key"; seen_browser=true ;;
+      browser_profile) [[ $seen_browser_profile == false ]] || config_error 'duplicate browser_profile' "duplicate config key: $key"; seen_browser_profile=true ;;
     esac
     [[ -n $value ]] || config_error "empty $key" "empty config value: $key"
     printf -v "$key" '%s' "$value"
@@ -176,6 +182,11 @@ load_config() {
     # excluding every C0/C1/Unicode control and avoiding terminal escape ambiguity.
     [[ $description != *[!\ -~]* ]] || config_error 'malformed description' 'malformed description'
   fi
+  case $browser in ''|chrome|firefox|brave) ;; *) config_error 'unsupported browser' 'browser must be chrome, firefox, or brave' ;; esac
+  [[ $seen_browser_profile == false || $seen_browser == true ]] || config_error 'browser_profile requires browser' 'browser_profile requires browser'
+  if [[ -n $browser_profile && $browser != firefox ]]; then
+    [[ $browser_profile != */* && $browser_profile != '.' && $browser_profile != '..' ]] || config_error 'malformed browser_profile' 'browser_profile must be a profile directory name'
+  fi
 
   [[ $cloudsdk_config == /* && $cloudsdk_config != *'/../'* && $cloudsdk_config != */.. && $cloudsdk_config != *'/./'* && $cloudsdk_config != */. ]] || die 'unsafe cloudsdk_config path'
   [[ -d $cloudsdk_config && ! -L $cloudsdk_config ]] || die 'unsafe cloudsdk_config path'
@@ -186,6 +197,76 @@ load_config() {
   [[ $expected_account =~ ^[A-Za-z0-9][A-Za-z0-9._%+-]{0,62}@[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] || die 'malformed expected_account'
   [[ $allowed_projects =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9](,[a-z][a-z0-9-]{4,28}[a-z0-9])*$ ]] || die 'malformed allowed_projects'
 }
+
+login_account() (
+  # Scope the browser override and temporary launcher to the two login flows.
+  local launcher_dir app executable candidate platform
+  local -a browser_command candidates
+  if [[ -n $browser ]]; then
+    platform=$(uname -s)
+    case $platform in
+      Darwin)
+        case $browser in
+          chrome) app='Google Chrome.app' ;;
+          firefox) app='Firefox.app' ;;
+          brave) app='Brave Browser.app' ;;
+        esac
+        for candidate in "$HOME/Applications/$app" "/Applications/$app"; do
+          if [[ -d $candidate ]]; then app=$candidate; break; fi
+        done
+        [[ $app == /* ]] || die "configured browser is not installed in ~/Applications or /Applications: $browser"
+        browser_command=(open -n -a "$app" --args)
+        ;;
+      Linux)
+        case $browser in
+          chrome) candidates=(google-chrome google-chrome-stable) ;;
+          firefox) candidates=(firefox) ;;
+          brave) candidates=(brave-browser brave-browser-stable brave) ;;
+        esac
+        executable=''
+        for candidate in "${candidates[@]}"; do
+          if executable=$(command -v "$candidate"); then break; fi
+        done
+        [[ -n $executable ]] || die "configured browser is not installed on PATH: $browser"
+        browser_command=("$executable")
+        ;;
+      *) die 'configured browser selection supports macOS and Linux' ;;
+    esac
+    if [[ -n $browser_profile ]]; then
+      if [[ $browser == firefox ]]; then
+        browser_command+=(-no-remote -P "$browser_profile")
+      else
+        browser_command+=("--profile-directory=$browser_profile")
+      fi
+    fi
+    # BROWSER is parsed by Python webbrowser (colon-separated, with %s expansion).
+    # Keep all user values in a shell-quoted launcher rather than that template.
+    launcher_dir=$(mktemp -d /tmp/gcp-vault-browser.XXXXXXXXXX) || die 'failed to create browser launcher'
+    trap 'rm -rf -- "${launcher_dir:?}"' EXIT
+    chmod 700 "$launcher_dir"
+    {
+      printf '#!/usr/bin/env bash\n'
+      [[ $platform != Darwin ]] || printf 'exec '
+      printf '%q ' "${browser_command[@]}"
+      if [[ $platform == Darwin ]]; then
+        # Expand the URL when the launcher runs.
+        # shellcheck disable=SC2016
+        printf '"$1"\n'
+      else
+        # Expand the URL when the launcher runs.
+        # shellcheck disable=SC2016
+        printf '"$1" </dev/null >/dev/null &\n'
+      fi
+    } > "$launcher_dir/open-browser"
+    chmod 700 "$launcher_dir/open-browser"
+    export BROWSER="$launcher_dir/open-browser %s"
+  fi
+  printf 'gcp-vault: Google Cloud CLI may ask for the Google Workspace password for %s.\n' "$expected_account"
+  printf 'gcp-vault: This is not your macOS login, Keychain, aws-vault, or gcp-vault password.\n'
+  printf 'gcp-vault: If offered, browser reauthentication is also valid.\n'
+  gcloud auth login "$expected_account" || die "gcloud account login failed: $expected_account"
+  gcloud auth application-default login || die "ADC login failed: $expected_account"
+)
 
 reject_credential_overrides() {
   local variable
@@ -235,11 +316,7 @@ main() {
 
   export CLOUDSDK_CONFIG="$cloudsdk_config" CLOUDSDK_CORE_ACCOUNT="$expected_account"
   if [[ $mode == login ]]; then
-    printf 'gcp-vault: Google Cloud CLI may ask for the Google Workspace password for %s.\n' "$expected_account"
-    printf 'gcp-vault: This is not your macOS login, Keychain, aws-vault, or gcp-vault password.\n'
-    printf 'gcp-vault: If offered, browser reauthentication is also valid.\n'
-    gcloud auth login "$expected_account" || die "gcloud account login failed: $expected_account"
-    gcloud auth application-default login || die "ADC login failed: $expected_account"
+    login_account
   fi
 
   [[ -f $adc_file && ! -L $adc_file ]] || die "ADC file not found or unsafe for account: $alias"

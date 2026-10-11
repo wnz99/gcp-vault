@@ -66,6 +66,9 @@ Configuration files accept exactly these keys:
   credentials, or token material in a description.
 - `expected_account`: Google account that both gcloud and ADC must use.
 - `allowed_projects`: comma-separated Google Cloud project IDs exposed to child commands.
+- `browser`: optional `chrome`, `firefox`, or `brave` for both web login flows on macOS or Linux.
+- `browser_profile`: optional browser profile selector; requires `browser`. For Chrome and Brave,
+  use a profile directory name such as `Default` or `Profile 1`. For Firefox, use a named profile.
 
 List configured aliases:
 
@@ -92,6 +95,43 @@ validates that both tokens resolve to `expected_account`. If Google Cloud CLI di
 `Please enter your password:`, it is asking for the Google Workspace password for the configured
 account. It is not asking for the macOS login, Keychain, `aws-vault`, or `gcp-vault` password;
 browser reauthentication is also valid when Google offers it.
+
+### Choose a login browser and profile
+
+Append these optional settings to an account file, for example
+`~/.config/gcp-vault/accounts/example`:
+
+```ini
+browser=chrome
+browser_profile=Profile 1
+```
+
+Use `browser=brave` with the same profile directory format. Find the directory name in the
+**Profile Path** shown at `chrome://version` or `brave://version`: use the final directory component,
+not the profile's display name or full path.
+
+For Firefox, select an existing named profile:
+
+```ini
+browser=firefox
+browser_profile=Work
+```
+
+Firefox uses [`-P` and `-no-remote`](https://firefox-source-docs.mozilla.org/browser/CommandLineParameters.html)
+to select the named profile without redirecting to another running profile. Close that profile's
+Firefox windows before logging in; a profile already in use may refuse another instance. This
+selector uses Firefox's traditional named profiles.
+
+Values are literal: do not add shell quotes around names containing spaces. Omitting
+`browser_profile` uses the selected browser's default profile. Omitting both settings preserves
+gcloud's normal browser selection, including an existing `BROWSER` environment variable.
+
+On macOS, install the selected app in `/Applications` or `~/Applications`; the latter takes
+precedence. On Linux, the browser executable must be on `PATH`: `google-chrome` or
+`google-chrome-stable`, `firefox`, or `brave-browser`, `brave-browser-stable`, or `brave`.
+Browser settings apply only to `gcp-vault login`; discovery output and child commands keep their
+existing behavior. Account and ADC identity checks still determine whether login succeeds.
+If a browser cannot open the login page, open gcloud's printed URL manually in the desired profile.
 
 ## Run commands
 
