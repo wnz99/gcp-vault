@@ -326,7 +326,7 @@ main() {
   gcloud auth print-access-token --account="$expected_account" >/dev/null 2>&1 || die "could not validate gcloud account token: $expected_account"
 
   export GOOGLE_APPLICATION_CREDENTIALS="$adc_file"
-  adc_token=$(gcloud auth application-default print-access-token 2>/dev/null) || die 'could not obtain ADC access token'
+  adc_token=$(gcloud auth application-default print-access-token --scopes=https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email 2>/dev/null) || die 'could not obtain ADC access token'
   [[ -n $adc_token && $adc_token != *[$'\r\n']* ]] || die 'invalid ADC access token'
   adc_email=$(printf 'access_token=%s' "$adc_token" | curl --disable --noproxy '*' --proto '=https' --tlsv1.2 --silent --show-error --fail --request POST --data-binary @- https://oauth2.googleapis.com/tokeninfo | jq -er '.email') || { unset adc_token; die 'could not validate ADC identity'; }
   unset adc_token

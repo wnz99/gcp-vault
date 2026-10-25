@@ -47,7 +47,7 @@ case "$*" in
     [[ ${FAKE_NAMED_TOKEN_FAIL:-0} != 1 ]] || exit 1
     printf '%s\n' named-token
     ;;
-  'auth application-default print-access-token')
+  'auth application-default print-access-token --scopes=https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email')
     [[ ${GOOGLE_APPLICATION_CREDENTIALS:-} == "$FAKE_PROFILE/application_default_credentials.json" ]] || exit 84
     [[ ${FAKE_ADC_TOKEN_FAIL:-0} != 1 ]] || exit 1
     printf '%s\n' adc-token
